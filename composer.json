@@ -1,0 +1,16 @@
+{
+  "name": "yourname/oidc-vercel-demo",
+  "description": "PHP OpenID Connect demo app for Vercel",
+  "type": "project",
+  "require": {
+    "jumbojett/openid-connect-php": "^0.9"
+  },
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  },
+  "scripts": {
+    "start": "php -S localhost:8000 -t api"
+  }
+}
