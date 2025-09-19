@@ -4,6 +4,9 @@ declare(strict_types=1);
 /**
  * Stateless OIDC (Auth Code + PKCE) for Keycloak + PDF upload
  * USER_ID in upload path = user's email (from userinfo)
+ * Uploads multipart/form-data with:
+ *  - attachment: application/pdf
+ *  - message:    application/json (per provided schema)
  */
 
 $DEBUG = getenv('DEBUG') === '1';
@@ -62,17 +65,18 @@ function http_post_form(string $url,array $fields,array $hdr=[],bool $vp=true,bo
 }
 
 /* -------------------- Env config -------------------- */
-$hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'),'/');   // e.g., https://idp.example.com
+$hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'),'/');   // e.g., https://idp.cloud.test.kobil.com
 $tenant        = trim((string)envv('TENANT_NAME',''));           // realm
 $clientId      = envv('OIDC_CLIENT_ID');
 $clientSecret  = envv('OIDC_CLIENT_SECRET');                     // empty if public client
 $redirectUri   = envv('OIDC_REDIRECT_URI');                      // EXACT, no *
 $logoutTo      = envv('OIDC_LOGOUT_REDIRECT',$redirectUri);
+$serviceUuid   = envv('SERVICE_UUID');                           // REQUIRED by API spec
 $verifyPeer    = envv('CURL_VERIFY_PEER','1')==='1';
 $verifyHost    = envv('CURL_VERIFY_HOST','1')==='1';
 
-if(!$hostBase||!$tenant||!$clientId||!$redirectUri){
-  fail(500,"Missing env: OIDC_PROVIDER_URL(host base), TENANT_NAME, OIDC_CLIENT_ID, OIDC_REDIRECT_URI");
+if(!$hostBase||!$tenant||!$clientId||!$redirectUri||!$serviceUuid){
+  fail(500,"Missing env: OIDC_PROVIDER_URL, TENANT_NAME, OIDC_CLIENT_ID, OIDC_REDIRECT_URI, SERVICE_UUID");
 }
 
 /* -------------------- Discovery (modern → legacy) -------------------- */
@@ -104,7 +108,7 @@ function csrf_check():void{
 $code  = $_GET['code']  ?? null;
 $state = $_GET['state'] ?? null;
 
-$accessToken = get_cookie('at');      // stored after PRG
+$accessToken = get_cookie('at'); // stored after PRG
 
 if (!$accessToken && !$code) {
   $st=rand_b64(16); $no=rand_b64(16); $ver=rand_b64(32);
@@ -114,7 +118,7 @@ if (!$accessToken && !$code) {
     'response_type'=>'code',
     'client_id'=>$clientId,
     'redirect_uri'=>$redirectUri,
-    'scope'=>'openid profile email',   // needs email in userinfo
+    'scope'=>'openid profile email',   // need email in userinfo
     'state'=>$st,
     'nonce'=>$no,
     'code_challenge'=>$chal,
@@ -136,7 +140,6 @@ if (!$accessToken && $code) {
   $accessToken = $tok['access_token'] ?? null;
   if(!$accessToken) fail(500,'No access_token from token endpoint');
 
-  // keep token briefly and redirect to clean URL (PRG)
   set_cookie('at',  $accessToken, 600);
   header('Location: '.$redirectUri); exit;
 }
@@ -151,7 +154,7 @@ $familyName = $ui['family_name'] ?? '';
 $name       = $ui['name']        ?? '';
 
 if(!$email){
-  fail(500,"Missing email in userinfo. Ensure Keycloak client has 'email' scope assigned.");
+  fail(500,"Missing email in userinfo. Ensure Keycloak client has the 'email' scope assigned.");
 }
 
 /* -------------------- Helpers: PDF + upload -------------------- */
@@ -181,15 +184,15 @@ HTML;
   return $pdf->output();
 }
 
-/** Per your spec: always /auth/realms/{TENANT_NAME}/mpower/v1/users/{EMAIL}/media */
+/** Upload URL per spec: /auth/realms/{TENANT_NAME}/mpower/v1/users/{EMAIL}/media */
 function chat_url(string $hostBase,string $tenant,string $email):string{
   return rtrim($hostBase,'/').'/auth/realms/'.rawurlencode($tenant).'/mpower/v1/users/'.rawurlencode($email).'/media';
 }
 
 /**
- * Upload PDF with multipart/form-data:
+ * Upload multipart/form-data with:
  *  - 'attachment' => PDF (application/pdf)
- *  - 'message'    => JSON object (application/json), because the server parses it with Gson as an object
+ *  - 'message'    => JSON object (application/json)
  */
 function upload_pdf(
   string $url,
@@ -208,8 +211,10 @@ function upload_pdf(
 
   // JSON message part
   $json = json_encode($messageObj, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+  // Use CURLStringFile if available so the part has application/json without temp file
   if (class_exists('CURLStringFile')) {
-    $msgPart = new CURLStringFile($json, 'application/json', 'message.json');   // PHP 8.1+
+    $msgPart = new CURLStringFile($json, 'application/json', 'message.json');
     $messageField = $msgPart;
   } else {
     $tmpJson = tmpfile();
@@ -221,7 +226,7 @@ function upload_pdf(
   $headers = [
     'Accept: application/json',
     'Authorization: Bearer '.$accessToken,
-    // Don't set Content-Type here; cURL adds the proper multipart boundary.
+    // Do not set Content-Type here; cURL sets proper multipart boundary.
   ];
 
   $fields = [
@@ -252,14 +257,18 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $pdfBytes = make_pdf(['first'=>$first,'last'=>$last,'email'=>$mail]);
     $endpoint = chat_url($hostBase, $tenant, $mail);
 
-    // Minimal JSON object the backend can parse; extend as needed by your API schema
+    // Build message JSON per your API schema
     $messageObj = [
-      'text'     => ($msgIn !== '' ? $msgIn : 'Form PDF'),
-      'filename' => 'profile-'.date('Ymd-His').'.pdf',
-      'mime'     => 'application/pdf'
+      "serviceUuid"  => $serviceUuid,
+      "messageType"  => "attachmentMessage",
+      "version"      => 3,
+      "messageContent" => [
+        "messageText" => ($msgIn !== '' ? $msgIn : "Form PDF")
+      ]
     ];
 
-    $resp = upload_pdf($endpoint, $accessToken, $pdfBytes, $messageObj['filename'], $messageObj, $verifyPeer, $verifyHost);
+    $filename = 'profile-'.date('Ymd-His').'.pdf';
+    $resp = upload_pdf($endpoint, $accessToken, $pdfBytes, $filename, $messageObj, $verifyPeer, $verifyHost);
 
     echo "<h2>Uploaded</h2>";
     echo "<p>Endpoint: <code>".htmlspecialchars($endpoint,ENT_QUOTES,'UTF-8')."</code></p>";
@@ -313,8 +322,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     <label for="email">Email (used as USER_ID)</label>
     <input id="email" type="email" name="email" value="<?= htmlspecialchars($email, ENT_QUOTES, 'UTF-8'); ?>">
 
-    <label for="message">Optional message</label>
-    <textarea id="message" name="message" rows="3" placeholder="(leave empty if not needed)">Form PDF</textarea>
+    <label for="message">Message text (optional)</label>
+    <textarea id="message" name="message" rows="3" placeholder="(leave empty to use 'Form PDF')">Form PDF</textarea>
 
     <button type="submit" name="send_pdf">Send as PDF</button>
   </form>
