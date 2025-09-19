@@ -76,7 +76,7 @@ try {
     $oidc->setRedirectURL($redirectUri);
 
     // Keep scopes minimal; ensure client has these scopes assigned in Keycloak
-    $oidc->addScope('openid profile email roles'); // if you also want email/profile: 'openid profile email'
+    $oidc->addScope(['openid', 'profile', 'email', 'roles']); // if you also want email/profile: 'openid profile email'
 
     // If discovery is restricted, uncomment to pin endpoints (Keycloak standard):
     // $kcBase = rtrim($providerUrl, '/');
