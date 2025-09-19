@@ -1,6 +1,11 @@
 <?php
 declare(strict_types=1);
 
+/**
+ * Stateless OIDC (Auth Code + PKCE) + PDF upload
+ * USER_ID in upload path = sub (subject) from userinfo/id_token/access token
+ */
+
 $DEBUG = getenv('DEBUG') === '1';
 if ($DEBUG) { ini_set('display_errors','1'); error_reporting(E_ALL); }
 
@@ -9,11 +14,12 @@ require __DIR__ . '/../vendor/autoload.php';
 use Dompdf\Dompdf;
 use Dompdf\Options;
 
+/** ----- Load .env locally (Vercel uses env UI) ----- */
 if (class_exists(\Dotenv\Dotenv::class)) {
   \Dotenv\Dotenv::createImmutable(__DIR__ . '/..')->safeLoad();
 }
 
-/* ---------- helpers ---------- */
+/** ----- Utils ----- */
 function envv(string $k, $d=null){
   if (array_key_exists($k,$_ENV)) return $_ENV[$k];
   if (array_key_exists($k,$_SERVER)) return $_SERVER[$k];
@@ -53,9 +59,23 @@ function http_post_form(string $url,array $fields,array $hdr=[],bool $vp=true,bo
   $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); $hsz=curl_getinfo($ch,CURLINFO_HEADER_SIZE); curl_close($ch);
   return ['status'=>$code,'headers'=>substr($res,0,$hsz),'body'=>substr($res,$hsz)];
 }
+function jwt_payload(string $jwt): ?array {
+  $parts = explode('.', $jwt);
+  if (count($parts) < 2) return null;
+  $payload = $parts[1];
+  $payload .= str_repeat('=', (4 - strlen($payload) % 4) % 4);
+  $json = base64_decode(strtr($payload, '-_', '+/'));
+  $arr = json_decode((string)$json, true);
+  return is_array($arr) ? $arr : null;
+}
+function jwt_sub(?string $jwt): ?string {
+  if (!$jwt) return null;
+  $p = jwt_payload($jwt);
+  return $p['sub'] ?? null;
+}
 
-/* ---------- env config ---------- */
-$hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'),'/');   // e.g. https://idp.example.com
+/** ----- Env config ----- */
+$hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'),'/');   // e.g., https://idp.example.com
 $tenant        = trim((string)envv('TENANT_NAME',''));           // realm
 $clientId      = envv('OIDC_CLIENT_ID');
 $clientSecret  = envv('OIDC_CLIENT_SECRET');                     // empty if public client
@@ -68,7 +88,7 @@ if(!$hostBase||!$tenant||!$clientId||!$redirectUri){
   fail(500,"Missing env: OIDC_PROVIDER_URL(host base), TENANT_NAME, OIDC_CLIENT_ID, OIDC_REDIRECT_URI");
 }
 
-/* ---------- discovery (modern then legacy) ---------- */
+/** ----- Discovery (modern then legacy) ----- */
 $issuerModern = $hostBase.'/auth/realms/'.rawurlencode($tenant);
 $issuerLegacy = $hostBase.'/auth/realms/'.rawurlencode($tenant);
 try { $disc=http_get_json($issuerModern.'/.well-known/openid-configuration',[], $verifyPeer,$verifyHost); $issuer=$issuerModern; }
@@ -78,14 +98,14 @@ $tokenEP = $disc['token_endpoint'] ?? null;
 $userEP  = $disc['userinfo_endpoint'] ?? null;
 if(!$authEP||!$tokenEP) fail(500,"Discovery missing endpoints");
 
-/* ---------- cookie helpers (HttpOnly, short-lived) ---------- */
+/** ----- Cookie helpers (HttpOnly, short-lived) ----- */
 function set_cookie(string $n,string $v,int $ttl=600){
   setcookie($n,$v,['expires'=>time()+$ttl,'path'=>'/','secure'=>true,'httponly'=>true,'samesite'=>'Lax']);
 }
 function get_cookie(string $n):?string{ return isset($_COOKIE[$n])?(string)$_COOKIE[$n]:null; }
 function del_cookie(string $n){ setcookie($n,'',time()-3600,'/'); }
 
-/* ---------- CSRF for HTML form ---------- */
+/** ----- CSRF for HTML form ----- */
 if (!get_cookie('csrf')) set_cookie('csrf', bin2hex(random_bytes(32)));
 function csrf_input():string{ return '<input type="hidden" name="csrf" value="'.htmlspecialchars(get_cookie('csrf')??'',ENT_QUOTES,'UTF-8').'">'; }
 function csrf_check():void{
@@ -93,11 +113,13 @@ function csrf_check():void{
   if(!$c || !$p || !hash_equals($c,(string)$p)) fail(400,'Bad Request (CSRF)');
 }
 
-/* ---------- Step 1: start OIDC if no tokens and no code ---------- */
+/** ----- Step 1: start OIDC if no tokens and no code ----- */
 $code  = $_GET['code']  ?? null;
 $state = $_GET['state'] ?? null;
 
-$accessToken = get_cookie('at'); // we keep it briefly after PRG
+$accessToken = get_cookie('at');      // stored after PRG
+$idToken     = get_cookie('idt');     // optional, stored after PRG
+
 if (!$accessToken && !$code) {
   $st=rand_b64(16); $no=rand_b64(16); $ver=rand_b64(32);
   $chal=rtrim(strtr(base64_encode(hash('sha256',$ver,true)),'+/','-_'),'=');
@@ -110,7 +132,7 @@ if (!$accessToken && !$code) {
   header('Location: '.$authEP.'?'.$qs); exit;
 }
 
-/* ---------- Step 2: callback → exchange code; PRG to clean URL ---------- */
+/** ----- Step 2: callback → exchange code; PRG to clean URL ----- */
 if (!$accessToken && $code) {
   $stc=get_cookie('oidc_state'); $ver=get_cookie('oidc_verif');
   if(!$stc || !$ver || !hash_equals($stc,(string)$state)) fail(400,'Invalid or missing state');
@@ -121,14 +143,16 @@ if (!$accessToken && $code) {
 
   $tok=http_post_urlenc($tokenEP,$post,[], $verifyPeer,$verifyHost);
   $accessToken = $tok['access_token'] ?? null;
+  $idToken     = $tok['id_token']     ?? null;
   if(!$accessToken) fail(500,'No access_token from token endpoint');
 
-  // keep access token briefly and redirect to clean URL (PRG)
-  set_cookie('at', $accessToken, 600);
+  // keep tokens briefly and redirect to clean URL (PRG)
+  set_cookie('at',  $accessToken, 600);
+  if ($idToken) set_cookie('idt', $idToken, 600);
   header('Location: '.$redirectUri); exit;
 }
 
-/* ---------- Step 3: we have an access token → fetch userinfo ---------- */
+/** ----- Step 3: we have an access token → fetch userinfo ----- */
 if (!$accessToken) fail(401,'Missing access token (login was not completed)');
 
 $ui = $userEP ? http_get_json($userEP,['Authorization: Bearer '.$accessToken], $verifyPeer,$verifyHost) : [];
@@ -136,15 +160,16 @@ $email      = $ui['email']       ?? '';
 $givenName  = $ui['given_name']  ?? '';
 $familyName = $ui['family_name'] ?? '';
 $name       = $ui['name']        ?? '';
-if(!$email){
-  // final fallback: try to decode id_token if present later (not stored here); best fix is to ensure 'email' scope
-  fail(500,"Missing email in userinfo. Ensure 'email' scope is assigned to the client.");
+$sub        = $ui['sub']         ?? (jwt_sub($idToken) ?? jwt_sub($accessToken));
+
+if(!$sub){
+  fail(500,"Could not determine user 'sub'. Ensure standard OIDC claims are returned.");
 }
-if(!$givenName && !$familyName && $name){
-  $p=preg_split('/\s+/', $name,2); $givenName=$p[0]??''; $familyName=$p[1]??'';
+if(!$email && $name){ // best-effort for UI
+  $parts=preg_split('/\s+/', $name,2); $givenName=$givenName ?: ($parts[0]??''); $familyName=$familyName ?: ($parts[1]??'');
 }
 
-/* ---------- Helpers: PDF + upload ---------- */
+/** ----- Helpers: PDF + upload ----- */
 function make_pdf(array $d):string{
   $f=htmlspecialchars($d['first']??'',ENT_QUOTES,'UTF-8');
   $l=htmlspecialchars($d['last']??'', ENT_QUOTES,'UTF-8');
@@ -161,7 +186,8 @@ h1{font-size:20px}.box{border:1px solid #999;padding:16px;border-radius:8px}
 <div class="box">
   <div class="row"><span class="lbl">First name:</span> $f</div>
   <div class="row"><span class="lbl">Last name:</span> $l</div>
-  <div class="row"><span class="lbl">Email (User ID):</span> $e</div>
+  <div class="row"><span class="lbl">Email:</span> $e</div>
+  <div class="row"><span class="lbl">User ID (sub):</span> <!-- sub will be used in path --></div>
 </div>
 <p class="muted">Generated at $now</p>
 </body></html>
@@ -170,48 +196,66 @@ HTML;
   $pdf=new Dompdf($opts); $pdf->loadHtml($html); $pdf->setPaper('A4','portrait'); $pdf->render();
   return $pdf->output();
 }
-function chat_url(string $hostBase,string $tenant,string $email):string{
-  return rtrim($hostBase,'/').'/auth/realms/'.rawurlencode($tenant).'/mpower/v1/users/'.rawurlencode($email).'/media';
+
+/** Per spec: always /auth/realms/{TENANT_NAME}/mpower/v1/users/{SUB}/media */
+function chat_url(string $hostBase,string $tenant,string $sub):string{
+  return rtrim($hostBase,'/').'/auth/realms/'.rawurlencode($tenant).'/mpower/v1/users/'.rawurlencode($sub).'/media';
 }
+
 function upload_pdf(string $url,string $accessToken,string $bytes,string $filename,string $message,bool $vp,bool $vh):array{
   $tmp=tmpfile(); $path=stream_get_meta_data($tmp)['uri']; file_put_contents($path,$bytes);
   $cfile=new CURLFile($path,'application/pdf',$filename);
-  return http_post_form($url, ['attachment'=>$cfile,'message'=>$message],
-    ['Accept: application/json','Authorization: Bearer '.$accessToken], $vp,$vh
+  $resp = http_post_form(
+    $url,
+    ['attachment'=>$cfile,'message'=>$message],
+    ['Accept: application/json','Authorization: Bearer '.$accessToken],
+    $vp,$vh
   );
+  fclose($tmp);
+  return $resp;
 }
 
-/* ---------- Handle POST (Send as PDF) ---------- */
+/** ----- Handle POST (Send as PDF) ----- */
 if ($_SERVER['REQUEST_METHOD']==='POST') {
-  csrf_check();
+  // CSRF
+  $cookieCsrf = get_cookie('csrf') ?? '';
+  $postedCsrf = $_POST['csrf'] ?? '';
+  if (!$cookieCsrf || !$postedCsrf || !hash_equals($cookieCsrf, (string)$postedCsrf)) {
+    fail(400,'Bad Request (CSRF)');
+  }
+
   if (isset($_POST['send_pdf'])) {
     $first = trim($_POST['first_name'] ?? '') ?: $givenName;
     $last  = trim($_POST['last_name']  ?? '') ?: $familyName;
-    $mail  = trim($_POST['email']      ?? '') ?: $email;   // USER_ID = email
+    $mail  = trim($_POST['email']      ?? '') ?: $email;
     $msg   = trim($_POST['message']    ?? '');
+    if ($msg === '') $msg = 'Form PDF';
 
-    if (!$mail) fail(500,'Email (USER_ID) is empty.');
+    // USER_ID = sub (not email)
+    $endpoint = chat_url($hostBase, $tenant, $sub);
+
     $pdfBytes = make_pdf(['first'=>$first,'last'=>$last,'email'=>$mail]);
-    $endpoint = chat_url($hostBase, $tenant, $mail);
     $resp = upload_pdf($endpoint, $accessToken, $pdfBytes, 'profile-'.date('Ymd-His').'.pdf', $msg, $verifyPeer, $verifyHost);
 
     echo "<h2>Uploaded</h2>";
     echo "<p>Endpoint: <code>".htmlspecialchars($endpoint,ENT_QUOTES,'UTF-8')."</code></p>";
     echo "<p>Status: <strong>".htmlspecialchars((string)$resp['status'],ENT_QUOTES,'UTF-8')."</strong></p>";
-    echo "<details><summary>Response body</summary><pre>".htmlspecialchars($resp['body'],ENT_QUOTES,'UTF-8')."</pre></details>";
+    echo "<details open><summary>Response headers</summary><pre>".htmlspecialchars($resp['headers'],ENT_QUOTES,'UTF-8')."</pre></details>";
+    echo "<details open><summary>Response body</summary><pre>".htmlspecialchars($resp['body'],ENT_QUOTES,'UTF-8')."</pre></details>";
     echo '<p><a href="'.htmlspecialchars($redirectUri,ENT_QUOTES,'UTF-8').'">Back</a></p>';
     exit;
   }
+
   header('Location: '.$redirectUri); exit;
 }
 
-/* ---------- Render UI ---------- */
+/** ----- Render UI ----- */
 ?>
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>OIDC → Prefilled Form → Send as PDF (stateless PRG)</title>
+  <title>OIDC → Prefilled Form → Send as PDF (USER_ID = sub)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:2rem;line-height:1.5}
@@ -242,11 +286,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       </div>
     </div>
 
-    <label for="email">Email (used as USER_ID)</label>
+    <label for="email">Email</label>
     <input id="email" type="email" name="email" value="<?= htmlspecialchars($email, ENT_QUOTES, 'UTF-8'); ?>">
 
     <label for="message">Optional message</label>
-    <textarea id="message" name="message" rows="3" placeholder="(leave empty if not needed)"></textarea>
+    <textarea id="message" name="message" rows="3" placeholder="(leave empty if not needed)">Form PDF</textarea>
 
     <button type="submit" name="send_pdf">Send as PDF</button>
   </form>
