@@ -2,11 +2,11 @@
 declare(strict_types=1);
 
 /**
- * Stateless Keycloak OIDC (Auth Code + PKCE) + PDF upload via client_credentials
+ * Stateless Keycloak OIDC (Auth Code + PKCE) + PDF upload via client_credentials (same client)
  * USER_ID in upload path = user's email (from userinfo)
- * Upload body (multipart/form-data):
- *   - attachment: application/pdf
- *   - message:    application/json  (as a file part named message.json)
+ * Multipart/form-data parts:
+ *   - attachment: application/pdf (filename: form.pdf)
+ *   - message:    application/json (file part: message.json)
  */
 
 $DEBUG = getenv('DEBUG') === '1';
@@ -34,6 +34,17 @@ function fail(int $code, string $msg){
 }
 function b64url(string $bin):string{ return rtrim(strtr(base64_encode($bin),'+/','-_'),'='); }
 function rand_b64(int $n=32):string{ return b64url(random_bytes($n)); }
+// Polyfills for older runtimes (Vercel is usually >=8.2, but safe anyway)
+if (!function_exists('str_starts_with')) {
+  function str_starts_with(string $haystack, string $needle): bool {
+    return $needle === '' || strncmp($haystack, $needle, strlen($needle)) === 0;
+  }
+}
+if (!function_exists('str_contains')) {
+  function str_contains(string $haystack, string $needle): bool {
+    return $needle === '' || strpos($haystack, $needle) !== false;
+  }
+}
 
 function http_get_json(string $url, array $hdr=[], bool $vp=true, bool $vh=true):array{
   $ch=curl_init($url);
@@ -157,36 +168,53 @@ if(!$email){
   fail(500,"Missing email in userinfo. Ensure the client has the 'email' scope assigned.");
 }
 
-/* ---------- Helpers: PDF + upload ---------- */
-function make_pdf(array $d):string{
-  $f=htmlspecialchars($d['first']??'',ENT_QUOTES,'UTF-8');
-  $l=htmlspecialchars($d['last']??'', ENT_QUOTES,'UTF-8');
-  $e=htmlspecialchars($d['email']??'',ENT_QUOTES,'UTF-8');
-  $now=date('Y-m-d H:i:s');
-  $html=<<<HTML
+/* ---------- Helpers: PDF (prefer mPDF) + upload ---------- */
+function make_pdf(array $d): string {
+  $f = htmlspecialchars($d['first']??'', ENT_QUOTES, 'UTF-8');
+  $l = htmlspecialchars($d['last'] ??'', ENT_QUOTES, 'UTF-8');
+  $e = htmlspecialchars($d['email']??'', ENT_QUOTES, 'UTF-8');
+  $now = date('Y-m-d H:i:s');
+
+  $html = <<<HTML
 <!doctype html><html><head><meta charset="utf-8"><style>
-body{font-family:DejaVu Sans,Arial,sans-serif;margin:32px}
-h1{font-size:20px}.box{border:1px solid #999;padding:16px;border-radius:8px}
-.row{margin:8px 0}.lbl{font-weight:700;width:160px;display:inline-block}
-.muted{color:#666;font-size:12px;margin-top:20px}
+body{font-family:DejaVu Sans, Arial, sans-serif; margin:32px}
+h1{font-size:20px} .box{border:1px solid #999; padding:16px; border-radius:8px}
+.row{margin:8px 0} .lbl{font-weight:700; width:160px; display:inline-block}
+.muted{color:#666; font-size:12px; margin-top:20px}
 </style></head><body>
 <h1>Profile Submission</h1>
 <div class="box">
-  <div class="row"><span class="lbl">First name:</span> $f</div>
-  <div class="row"><span class="lbl">Last name:</span> $l</div>
-  <div class="row"><span class="lbl">Email (User ID):</span> $e</div>
+  <div class="row"><span class="lbl">First name:</span> {$f}</div>
+  <div class="row"><span class="lbl">Last name:</span> {$l}</div>
+  <div class="row"><span class="lbl">Email (User ID):</span> {$e}</div>
 </div>
-<p class="muted">Generated at $now</p>
+<p class="muted">Generated at {$now}</p>
 </body></html>
 HTML;
-  $opts=new Options(); $opts->set('isRemoteEnabled',false);
-  $pdf=new Dompdf($opts); $pdf->loadHtml($html); $pdf->setPaper('A4','portrait'); $pdf->render();
-  return $pdf->output();
+
+  if (class_exists('\\Mpdf\\Mpdf')) {
+    $mpdf = new \Mpdf\Mpdf([
+      'mode'   => 'utf-8',
+      'format' => 'A4',
+      // iOS tends to like embedded fonts; mPDF handles this well by default.
+      'useSubstitutions' => false,
+    ]);
+    $mpdf->WriteHTML($html);
+    return $mpdf->Output('', \Mpdf\Output\Destination::STRING_RETURN);
+  } else {
+    // Fallback to Dompdf if mPDF not installed
+    $opts = new \Dompdf\Options(); $opts->set('isRemoteEnabled', false);
+    $pdf  = new \Dompdf\Dompdf($opts);
+    $pdf->loadHtml($html);
+    $pdf->setPaper('A4', 'portrait');
+    $pdf->render();
+    return $pdf->output();
+  }
 }
 
 /** Upload URL: /auth/realms/{TENANT_NAME}/mpower/v1/users/{EMAIL}/media */
 function chat_url(string $hostBase,string $tenant,string $email):string{
-  // If your server requires raw '@', keep $email as-is; otherwise you may urlencode it.
+  // If backend requires raw '@', keep as-is; otherwise encode as needed.
   return rtrim($hostBase,'/').'/auth/realms/'.$tenant.'/mpower/v1/users/'.$email.'/media';
 }
 
@@ -239,15 +267,30 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     if (!$mail) fail(500,'Email (USER_ID) is empty.');
 
     $pdfBytes = make_pdf(['first'=>$first,'last'=>$last,'email'=>$mail]);
+
+    // Integrity checks (helps catch PDF issues that iOS dislikes)
+    $okHeader = str_starts_with($pdfBytes, '%PDF-');
+    $okEOF    = str_contains($pdfBytes, '%%EOF');
+    if (!$okHeader || !$okEOF) {
+      file_put_contents(sys_get_temp_dir().'/bad.pdf', $pdfBytes);
+      fail(500, "Generated PDF failed integrity check.");
+    }
+
     $endpoint = chat_url($hostBase, $tenant, $mail);
 
-    // Build message JSON per your spec
+    // Use a simple ASCII filename (iOS-friendly)
+    $filename = 'form.pdf';
+
+    // Build message JSON per your spec + iOS-friendly metadata
     $messageObj = [
       "serviceUuid"    => $serviceUuid,
       "messageType"    => "attachmentMessage",
       "version"        => 3,
       "messageContent" => [
-        "messageText"  => ($msgIn !== '' ? $msgIn : "Form PDF")
+        "messageText"  => ($msgIn !== '' ? $msgIn : "Form PDF"),
+        "fileName"     => $filename,
+        "mimeType"     => "application/pdf",
+        "sizeBytes"    => strlen($pdfBytes)
       ]
     ];
 
@@ -268,7 +311,6 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     }
 
     // Upload
-    $filename = 'profile-'.date('Ymd-His').'.pdf';
     $resp = upload_pdf_with_service_token($endpoint, $serviceAccessToken, $pdfBytes, $filename, $messageObj, $verifyPeer, $verifyHost);
 
     echo "<h2>Uploaded</h2>";
@@ -289,7 +331,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>OIDC → Prefilled Form → Send as PDF</title>
+  <title>OIDC → Prefilled Form → Send as PDF (mPDF)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:2rem;line-height:1.5}
