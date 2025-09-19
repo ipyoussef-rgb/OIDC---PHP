@@ -288,6 +288,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Build URL: {issuerBase}/mpower/v1/users/{USER_ID}/media (keeps /auth prefix if present)
         try {
             $mediaUrl = build_media_api_url($providerUrl, $userId);
+            echo "<p>DEBUG → Will POST PDF to: <code>" . htmlspecialchars($mediaUrl, ENT_QUOTES, 'UTF-8') . "</code></p>";
+
         } catch (Throwable $e) {
             http_response_code(500);
             echo "<h2>API URL error</h2><pre>" . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8') . "</pre>";
