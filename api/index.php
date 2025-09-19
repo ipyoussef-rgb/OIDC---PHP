@@ -106,7 +106,7 @@ if (!$hostBase || !$tenant || !$clientId || !$redirectUri) {
 }
 
 /** ===== Build realm issuer (modern & legacy), discover endpoints ===== */
-$issuerModern = $hostBase . '/realms/' . rawurlencode($tenant);
+$issuerModern = $hostBase . '/auth/realms/' . rawurlencode($tenant);
 $issuerLegacy = $hostBase . '/auth/realms/' . rawurlencode($tenant);
 
 $discovery = null;
