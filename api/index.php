@@ -85,14 +85,14 @@ function get_service_token_from_well_known(array $wk, string $clientId, string $
 /* -------------------- Env config -------------------- */
 $hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'),'/');   // e.g., https://idp.cloud.test.kobil.com
 $tenant        = trim((string)envv('TENANT_NAME',''));           // realm
-$clientId      = envv('OIDC_CLIENT_ID');                         // for login
+$clientId      = envv('OIDC_CLIENT_ID');                        // for login
 $clientSecret  = envv('OIDC_CLIENT_SECRET');                     // for login (may be empty for public)
 $redirectUri   = envv('OIDC_REDIRECT_URI');                      // EXACT, no *
 $logoutTo      = envv('OIDC_LOGOUT_REDIRECT',$redirectUri);
 $serviceUuid   = envv('SERVICE_UUID');                           // for message JSON
 $wkUrl         = envv('WELL_KNOWN');                             // e.g., https://.../auth/realms/worms/.well-known/openid-configuration
-$svcClientId   = envv('CLIENT_ID');                              // service client for /media
-$svcClientSec  = envv('CLIENT_SECRET');                          // service client secret
+$svcClientId   = envv('OIDC_CLIENT_ID');                              // service client for /media
+$svcClientSec  = envv('OIDC_CLIENT_SECRET');                         // service client secret
 $verifyPeer    = envv('CURL_VERIFY_PEER','1')==='1';
 $verifyHost    = envv('CURL_VERIFY_HOST','1')==='1';
 
