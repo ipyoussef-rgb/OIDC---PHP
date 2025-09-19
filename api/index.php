@@ -2,9 +2,9 @@
 declare(strict_types=1);
 
 /**
- * Keycloak OIDC (Auth Code + PKCE) → Prefilled form → PDF (mPDF) → Upload via client_credentials
+ * Keycloak OIDC (Auth Code + PKCE) → /userinfo (POST, cached) → PDF via FPDF (no GD) → Upload via client_credentials
  * USER_ID in upload path = user's email (from /userinfo)
- * Multipart/form-data parts:
+ * Multipart parts:
  *   - attachment: application/pdf (filename: form.pdf)
  *   - message:    application/json (file: message.json; includes fileName/mimeType/sizeBytes)
  */
@@ -14,8 +14,14 @@ if ($DEBUG) { ini_set('display_errors','1'); error_reporting(E_ALL); }
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Dompdf\Dompdf;
-use Dompdf\Options;
+// FPDF is not namespaced (class \FPDF)
+if (!class_exists('FPDF')) {
+  // Composer provides class autoload; this is a safety check
+  // If it fails, tell the user clearly:
+  http_response_code(500);
+  echo "FPDF not found. Run: composer require setasign/fpdf:^1.8";
+  exit;
+}
 
 /* ---------- Load .env locally (Vercel uses env UI) ---------- */
 if (class_exists(\Dotenv\Dotenv::class)) {
@@ -164,7 +170,7 @@ if (!$userAccessToken && $code) {
   $idToken         = $tok['id_token']     ?? null;
   if(!$userAccessToken || !$idToken) fail(500,'Missing tokens from token endpoint');
 
-  // Call /userinfo immediately (POST) while session is fresh; cache for next load
+  // Call /userinfo immediately (POST) and cache
   $ui = userinfo_via_post($userEP, $userAccessToken, $verifyPeer, $verifyHost);
 
   set_cookie('at',  $userAccessToken, 600);
@@ -174,7 +180,7 @@ if (!$userAccessToken && $code) {
   header('Location: '.$redirectUri); exit;
 }
 
-/* ---------- Use cached /userinfo (iOS-safe) or refresh if missing ---------- */
+/* ---------- Use cached /userinfo or refresh if missing ---------- */
 if (!$userAccessToken) fail(401,'Missing access token (login not completed)');
 
 $uiCookie = get_cookie('ui');
@@ -192,47 +198,42 @@ $familyName = $ui['family_name'] ?? '';
 $name       = $ui['name']        ?? trim(($givenName.' '.$familyName));
 if(!$email){ fail(500,"Missing email in userinfo."); }
 
-/* ---------- PDF (prefer mPDF) ---------- */
+/* ---------- PDF via FPDF (no GD) ---------- */
+function latinize(string $s): string {
+  // FPDF expects ISO-8859-1; convert from UTF-8 with transliteration
+  $out = @iconv('UTF-8', 'ISO-8859-1//TRANSLIT', $s);
+  return $out !== false ? $out : preg_replace('/[^\x20-\x7E]/', '?', $s);
+}
 function make_pdf(array $d): string {
-  $f = htmlspecialchars($d['first']??'', ENT_QUOTES, 'UTF-8');
-  $l = htmlspecialchars($d['last'] ??'', ENT_QUOTES, 'UTF-8');
-  $e = htmlspecialchars($d['email']??'', ENT_QUOTES, 'UTF-8');
-  $now = date('Y-m-d H:i:s');
+  $f = latinize($d['first']??'');
+  $l = latinize($d['last'] ??'');
+  $e = latinize($d['email']??'');
+  $now = latinize(date('Y-m-d H:i:s'));
 
-  $html = <<<HTML
-<!doctype html><html><head><meta charset="utf-8"><style>
-body{font-family:DejaVu Sans, Arial, sans-serif; margin:32px}
-h1{font-size:20px} .box{border:1px solid #999; padding:16px; border-radius:8px}
-.row{margin:8px 0} .lbl{font-weight:700; width:160px; display:inline-block}
-.muted{color:#666; font-size:12px; margin-top:20px}
-</style></head><body>
-<h1>Profile Submission</h1>
-<div class="box">
-  <div class="row"><span class="lbl">First name:</span> {$f}</div>
-  <div class="row"><span class="lbl">Last name:</span> {$l}</div>
-  <div class="row"><span class="lbl">Email (User ID):</span> {$e}</div>
-</div>
-<p class="muted">Generated at {$now}</p>
-</body></html>
-HTML;
+  $pdf = new \FPDF('P','mm','A4');
+  $pdf->AddPage();
+  $pdf->SetTitle('Profile Submission');
+  $pdf->SetAuthor('php-oidc');
+  $pdf->SetFont('Arial','B',16);
+  $pdf->Cell(0,10,'Profile Submission',0,1,'L');
+  $pdf->Ln(4);
 
-  if (class_exists('\\Mpdf\\Mpdf')) {
-    $mpdf = new \Mpdf\Mpdf(['mode'=>'utf-8','format'=>'A4','useSubstitutions'=>false]);
-    $mpdf->WriteHTML($html);
-    return $mpdf->Output('', \Mpdf\Output\Destination::STRING_RETURN);
-  } else {
-    $opts = new \Dompdf\Options(); $opts->set('isRemoteEnabled', false);
-    $pdf  = new \Dompdf\Dompdf($opts);
-    $pdf->loadHtml($html);
-    $pdf->setPaper('A4', 'portrait');
-    $pdf->render();
-    return $pdf->output();
-  }
+  $pdf->SetFont('Arial','',12);
+  $pdf->Cell(40,8,'First name:',0,0); $pdf->Cell(0,8,$f,0,1);
+  $pdf->Cell(40,8,'Last name:', 0,0); $pdf->Cell(0,8,$l,0,1);
+  $pdf->Cell(40,8,'Email:',      0,0); $pdf->Cell(0,8,$e,0,1);
+
+  $pdf->Ln(6);
+  $pdf->SetFont('Arial','I',9);
+  $pdf->Cell(0,6,"Generated at $now",0,1,'L');
+
+  // Return bytes as string
+  return $pdf->Output('S');
 }
 
 /** Upload URL: /auth/realms/{TENANT_NAME}/mpower/v1/users/{EMAIL}/media */
 function chat_url(string $hostBase,string $tenant,string $email):string{
-  // Keep raw '@' if your backend expects it; otherwise encode as needed.
+  // Keep raw '@' if backend expects it; encode if needed.
   return rtrim($hostBase,'/').'/auth/realms/'.$tenant.'/mpower/v1/users/'.$email.'/media';
 }
 
@@ -332,7 +333,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>OIDC → Prefilled Form → Send as PDF (iOS-safe)</title>
+  <title>OIDC → Prefilled Form → Send as PDF (FPDF, iOS-safe)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:2rem;line-height:1.5}
