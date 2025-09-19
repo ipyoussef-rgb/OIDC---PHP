@@ -2,11 +2,11 @@
 declare(strict_types=1);
 
 /**
- * Stateless Keycloak OIDC (Auth Code + PKCE) + PDF upload via client_credentials (same client)
- * USER_ID in upload path = user's email (from userinfo)
+ * Keycloak OIDC (Auth Code + PKCE) → Prefilled form → PDF (mPDF) → Upload via client_credentials
+ * USER_ID in upload path = user's email (from /userinfo)
  * Multipart/form-data parts:
  *   - attachment: application/pdf (filename: form.pdf)
- *   - message:    application/json (file part: message.json)
+ *   - message:    application/json (file: message.json; includes fileName/mimeType/sizeBytes)
  */
 
 $DEBUG = getenv('DEBUG') === '1';
@@ -34,17 +34,8 @@ function fail(int $code, string $msg){
 }
 function b64url(string $bin):string{ return rtrim(strtr(base64_encode($bin),'+/','-_'),'='); }
 function rand_b64(int $n=32):string{ return b64url(random_bytes($n)); }
-// Polyfills for older runtimes (Vercel is usually >=8.2, but safe anyway)
-if (!function_exists('str_starts_with')) {
-  function str_starts_with(string $haystack, string $needle): bool {
-    return $needle === '' || strncmp($haystack, $needle, strlen($needle)) === 0;
-  }
-}
-if (!function_exists('str_contains')) {
-  function str_contains(string $haystack, string $needle): bool {
-    return $needle === '' || strpos($haystack, $needle) !== false;
-  }
-}
+if (!function_exists('str_starts_with')) { function str_starts_with(string $h,string $n):bool{ return $n===''||strncmp($h,$n,strlen($n))===0; } }
+if (!function_exists('str_contains'))    { function str_contains(string $h,string $n):bool{ return $n===''||strpos($h,$n)!==false; } }
 
 function http_get_json(string $url, array $hdr=[], bool $vp=true, bool $vh=true):array{
   $ch=curl_init($url);
@@ -75,12 +66,33 @@ function http_post_form(string $url,array $fields,array $hdr=[],bool $vp=true,bo
   return ['status'=>$code,'headers'=>substr($res,0,$hsz),'body'=>substr($res,$hsz)];
 }
 
+/* ---------- /userinfo via POST (more reliable on iOS) ---------- */
+function userinfo_via_post(string $userinfoEP, string $accessToken, bool $vp, bool $vh): array {
+  $ch = curl_init($userinfoEP);
+  curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST           => true,
+    CURLOPT_POSTFIELDS     => http_build_query(['access_token' => $accessToken]),
+    CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
+    CURLOPT_SSL_VERIFYPEER => $vp,
+    CURLOPT_SSL_VERIFYHOST => $vh ? 2 : 0,
+    CURLOPT_TIMEOUT        => 30,
+  ]);
+  $res  = curl_exec($ch);
+  if ($res === false) { $e = curl_error($ch); curl_close($ch); fail(500, "POST $userinfoEP failed: $e"); }
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+  if ($code < 200 || $code >= 300) fail(401, "userinfo HTTP $code\n$res");
+  $j = json_decode($res, true);
+  if (!is_array($j)) fail(500, "userinfo not JSON");
+  return $j;
+}
+
 /* ---------- Env config ---------- */
 $hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'),'/');   // e.g., https://idp.cloud.test.kobil.com
 $tenant        = trim((string)envv('TENANT_NAME',''));           // realm
-$clientId      = envv('OIDC_CLIENT_ID');                         // used for login AND client_credentials
-$clientSecret  = envv('OIDC_CLIENT_SECRET');                     // must be set for client_credentials
-$redirectUri   = envv('OIDC_REDIRECT_URI');                      // EXACT, no *
+$clientId      = envv('OIDC_CLIENT_ID');                         // login + client_credentials
+$clientSecret  = envv('OIDC_CLIENT_SECRET');                     // required for client_credentials
+$redirectUri   = envv('OIDC_REDIRECT_URI');                      // EXACT
 $logoutTo      = envv('OIDC_LOGOUT_REDIRECT',$redirectUri);
 $serviceUuid   = envv('SERVICE_UUID');                           // for message JSON
 $verifyPeer    = envv('CURL_VERIFY_PEER','1')==='1';
@@ -98,16 +110,16 @@ catch(\Throwable){ $disc=http_get_json($issuerLegacy.'/.well-known/openid-config
 $authEP  = $disc['authorization_endpoint'] ?? null;
 $tokenEP = $disc['token_endpoint'] ?? null;
 $userEP  = $disc['userinfo_endpoint'] ?? null;
-if(!$authEP||!$tokenEP) fail(500,"Discovery missing endpoints");
+if(!$authEP||!$tokenEP||!$userEP) fail(500,"Discovery missing endpoints");
 
-/* ---------- Short-lived HttpOnly cookies (stateless) ---------- */
+/* ---------- HttpOnly cookies (stateless) ---------- */
 function set_cookie(string $n,string $v,int $ttl=600){
   setcookie($n,$v,['expires'=>time()+$ttl,'path'=>'/','secure'=>true,'httponly'=>true,'samesite'=>'Lax']);
 }
 function get_cookie(string $n):?string{ return isset($_COOKIE[$n])?(string)$_COOKIE[$n]:null; }
 function del_cookie(string $n){ setcookie($n,'',time()-3600,'/'); }
 
-/* ---------- CSRF for HTML form ---------- */
+/* ---------- CSRF ---------- */
 if (!get_cookie('csrf')) set_cookie('csrf', bin2hex(random_bytes(32)));
 function csrf_input():string{ return '<input type="hidden" name="csrf" value="'.htmlspecialchars(get_cookie('csrf')??'',ENT_QUOTES,'UTF-8').'">'; }
 function csrf_check():void{
@@ -115,11 +127,11 @@ function csrf_check():void{
   if(!$c || !$p || !hash_equals($c,(string)$p)) fail(400,'Bad Request (CSRF)');
 }
 
-/* ---------- Step 1: start OIDC if no tokens and no code ---------- */
+/* ---------- OIDC start ---------- */
 $code  = $_GET['code']  ?? null;
 $state = $_GET['state'] ?? null;
 
-$userAccessToken = get_cookie('at'); // stored after PRG
+$userAccessToken = get_cookie('at');
 
 if (!$userAccessToken && !$code) {
   $st=rand_b64(16); $no=rand_b64(16); $ver=rand_b64(32);
@@ -129,7 +141,7 @@ if (!$userAccessToken && !$code) {
     'response_type'=>'code',
     'client_id'=>$clientId,
     'redirect_uri'=>$redirectUri,
-    'scope'=>'openid profile email',   // need email in userinfo
+    'scope'=>'openid profile email',
     'state'=>$st,
     'nonce'=>$no,
     'code_challenge'=>$chal,
@@ -138,7 +150,7 @@ if (!$userAccessToken && !$code) {
   header('Location: '.$authEP.'?'.$qs); exit;
 }
 
-/* ---------- Step 2: callback → exchange code; PRG to clean URL ---------- */
+/* ---------- Callback → exchange code; call /userinfo immediately; PRG ---------- */
 if (!$userAccessToken && $code) {
   $stc=get_cookie('oidc_state'); $ver=get_cookie('oidc_verif');
   if(!$stc || !$ver || !hash_equals($stc,(string)$state)) fail(400,'Invalid or missing state');
@@ -149,26 +161,38 @@ if (!$userAccessToken && $code) {
 
   $tok=http_post_urlenc($tokenEP,$post,[], $verifyPeer,$verifyHost);
   $userAccessToken = $tok['access_token'] ?? null;
-  if(!$userAccessToken) fail(500,'No access_token from token endpoint');
+  $idToken         = $tok['id_token']     ?? null;
+  if(!$userAccessToken || !$idToken) fail(500,'Missing tokens from token endpoint');
+
+  // Call /userinfo immediately (POST) while session is fresh; cache for next load
+  $ui = userinfo_via_post($userEP, $userAccessToken, $verifyPeer, $verifyHost);
 
   set_cookie('at',  $userAccessToken, 600);
+  set_cookie('idt', $idToken,        600);
+  set_cookie('ui',  base64_encode(json_encode($ui, JSON_UNESCAPED_UNICODE)), 600);
+
   header('Location: '.$redirectUri); exit;
 }
 
-/* ---------- Step 3: we have a user access token → fetch userinfo ---------- */
-if (!$userAccessToken) fail(401,'Missing access token (login was not completed)');
+/* ---------- Use cached /userinfo (iOS-safe) or refresh if missing ---------- */
+if (!$userAccessToken) fail(401,'Missing access token (login not completed)');
 
-$ui = $userEP ? http_get_json($userEP,['Authorization: Bearer '.$userAccessToken], $verifyPeer,$verifyHost) : [];
+$uiCookie = get_cookie('ui');
+$ui = $uiCookie ? json_decode(base64_decode($uiCookie), true) : null;
+
+if (!is_array($ui)) {
+  try { $ui = userinfo_via_post($userEP, $userAccessToken, $verifyPeer, $verifyHost); }
+  catch (\Throwable $e) { $ui = http_get_json($userEP, ['Authorization: Bearer '.$userAccessToken], $verifyPeer, $verifyHost); }
+  set_cookie('ui', base64_encode(json_encode($ui, JSON_UNESCAPED_UNICODE)), 600);
+}
+
 $email      = $ui['email']       ?? '';
 $givenName  = $ui['given_name']  ?? '';
 $familyName = $ui['family_name'] ?? '';
-$name       = $ui['name']        ?? '';
+$name       = $ui['name']        ?? trim(($givenName.' '.$familyName));
+if(!$email){ fail(500,"Missing email in userinfo."); }
 
-if(!$email){
-  fail(500,"Missing email in userinfo. Ensure the client has the 'email' scope assigned.");
-}
-
-/* ---------- Helpers: PDF (prefer mPDF) + upload ---------- */
+/* ---------- PDF (prefer mPDF) ---------- */
 function make_pdf(array $d): string {
   $f = htmlspecialchars($d['first']??'', ENT_QUOTES, 'UTF-8');
   $l = htmlspecialchars($d['last'] ??'', ENT_QUOTES, 'UTF-8');
@@ -193,16 +217,10 @@ h1{font-size:20px} .box{border:1px solid #999; padding:16px; border-radius:8px}
 HTML;
 
   if (class_exists('\\Mpdf\\Mpdf')) {
-    $mpdf = new \Mpdf\Mpdf([
-      'mode'   => 'utf-8',
-      'format' => 'A4',
-      // iOS tends to like embedded fonts; mPDF handles this well by default.
-      'useSubstitutions' => false,
-    ]);
+    $mpdf = new \Mpdf\Mpdf(['mode'=>'utf-8','format'=>'A4','useSubstitutions'=>false]);
     $mpdf->WriteHTML($html);
     return $mpdf->Output('', \Mpdf\Output\Destination::STRING_RETURN);
   } else {
-    // Fallback to Dompdf if mPDF not installed
     $opts = new \Dompdf\Options(); $opts->set('isRemoteEnabled', false);
     $pdf  = new \Dompdf\Dompdf($opts);
     $pdf->loadHtml($html);
@@ -214,11 +232,11 @@ HTML;
 
 /** Upload URL: /auth/realms/{TENANT_NAME}/mpower/v1/users/{EMAIL}/media */
 function chat_url(string $hostBase,string $tenant,string $email):string{
-  // If backend requires raw '@', keep as-is; otherwise encode as needed.
+  // Keep raw '@' if your backend expects it; otherwise encode as needed.
   return rtrim($hostBase,'/').'/auth/realms/'.$tenant.'/mpower/v1/users/'.$email.'/media';
 }
 
-/** Upload using service (client_credentials) token; message is application/json file part */
+/** Upload using client_credentials; message is application/json file part */
 function upload_pdf_with_service_token(
   string $url,
   string $serviceAccessToken,
@@ -228,26 +246,17 @@ function upload_pdf_with_service_token(
   bool   $vp,
   bool   $vh
 ): array {
-  // Temp PDF
   $tmpPdf = tmpfile(); $pdfPath = stream_get_meta_data($tmpPdf)['uri'];
   file_put_contents($pdfPath, $bytes);
   $pdfPart = new CURLFile($pdfPath, 'application/pdf', $filename);
 
-  // Temp JSON file for 'message' with correct Content-Type
   $json = json_encode($messageObj, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
   $tmpJson = tmpfile(); $jsonPath = stream_get_meta_data($tmpJson)['uri'];
   file_put_contents($jsonPath, $json);
   $messageField = new CURLFile($jsonPath, 'application/json', 'message.json');
 
-  $headers = [
-    'Accept: application/json',
-    'Authorization: Bearer '.$serviceAccessToken,
-    // DO NOT set Content-Type here; cURL sets multipart boundary.
-  ];
-  $fields = [
-    'attachment' => $pdfPart,
-    'message'    => $messageField,
-  ];
+  $headers = ['Accept: application/json','Authorization: Bearer '.$serviceAccessToken];
+  $fields  = ['attachment'=>$pdfPart,'message'=>$messageField];
   $resp = http_post_form($url, $fields, $headers, $vp, $vh);
 
   fclose($tmpPdf); fclose($tmpJson);
@@ -261,14 +270,14 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
   if (isset($_POST['send_pdf'])) {
     $first = trim($_POST['first_name'] ?? '') ?: $givenName;
     $last  = trim($_POST['last_name']  ?? '') ?: $familyName;
-    $mail  = trim($_POST['email']      ?? '') ?: $email;   // USER_ID = email
+    $mail  = trim($_POST['email']      ?? '') ?: $email;
     $msgIn = trim($_POST['message']    ?? '');
 
     if (!$mail) fail(500,'Email (USER_ID) is empty.');
 
     $pdfBytes = make_pdf(['first'=>$first,'last'=>$last,'email'=>$mail]);
 
-    // Integrity checks (helps catch PDF issues that iOS dislikes)
+    // Integrity checks (helps iOS)
     $okHeader = str_starts_with($pdfBytes, '%PDF-');
     $okEOF    = str_contains($pdfBytes, '%%EOF');
     if (!$okHeader || !$okEOF) {
@@ -277,11 +286,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     }
 
     $endpoint = chat_url($hostBase, $tenant, $mail);
+    $filename = 'form.pdf'; // ASCII, iOS-friendly
 
-    // Use a simple ASCII filename (iOS-friendly)
-    $filename = 'form.pdf';
-
-    // Build message JSON per your spec + iOS-friendly metadata
     $messageObj = [
       "serviceUuid"    => $serviceUuid,
       "messageType"    => "attachmentMessage",
@@ -294,10 +300,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       ]
     ];
 
-    // Fetch service token (client_credentials) using the SAME OIDC client
-    if (strlen((string)$clientSecret) === 0) {
-      fail(500, "CLIENT_CREDENTIALS requires OIDC_CLIENT_SECRET (your OIDC client can't be public here).");
-    }
+    // client_credentials using SAME OIDC client
+    if (strlen((string)$clientSecret) === 0) fail(500, "CLIENT_CREDENTIALS requires OIDC_CLIENT_SECRET.");
     try {
       $svcTok = http_post_urlenc($tokenEP, [
         'grant_type'    => 'client_credentials',
@@ -306,11 +310,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       ], [], $verifyPeer, $verifyHost);
       $serviceAccessToken = $svcTok['access_token'] ?? null;
       if (!$serviceAccessToken) throw new RuntimeException('No access_token in client_credentials response');
-    } catch (\Throwable $e) {
-      fail(500, "Failed to get service token: ".$e->getMessage());
-    }
+    } catch (\Throwable $e) { fail(500, "Failed to get service token: ".$e->getMessage()); }
 
-    // Upload
     $resp = upload_pdf_with_service_token($endpoint, $serviceAccessToken, $pdfBytes, $filename, $messageObj, $verifyPeer, $verifyHost);
 
     echo "<h2>Uploaded</h2>";
@@ -331,7 +332,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>OIDC → Prefilled Form → Send as PDF (mPDF)</title>
+  <title>OIDC → Prefilled Form → Send as PDF (iOS-safe)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:2rem;line-height:1.5}
