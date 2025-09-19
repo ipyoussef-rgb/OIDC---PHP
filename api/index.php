@@ -1,157 +1,243 @@
 <?php
 declare(strict_types=1);
 
+/** ===== Debug toggle ===== */
+$DEBUG = getenv('DEBUG') === '1';
+if ($DEBUG) { ini_set('display_errors','1'); error_reporting(E_ALL); }
+
+/** ===== Autoload ===== */
 require __DIR__ . '/../vendor/autoload.php';
 
-use Jumbojett\OpenIDConnectClient;
 use Dompdf\Dompdf;
 use Dompdf\Options;
 
-/**
- * Load .env locally; on Vercel set env vars in the dashboard.
- */
+/** ===== Load .env locally (Vercel uses env UI) ===== */
 if (class_exists(\Dotenv\Dotenv::class)) {
-    $dotenv = Dotenv\Dotenv::createImmutable(__DIR__ . '/..');
-    $dotenv->safeLoad();
+  \Dotenv\Dotenv::createImmutable(__DIR__ . '/..')->safeLoad();
 }
 
-/** Small env helper that checks $_ENV/$_SERVER/getenv */
-function env(string $key, $default = null) {
-    if (array_key_exists($key, $_ENV))    return $_ENV[$key];
-    if (array_key_exists($key, $_SERVER)) return $_SERVER[$key];
-    $v = getenv($key);
-    return ($v !== false && $v !== null) ? $v : $default;
+/** ===== Utilities ===== */
+function envv(string $k, $d=null) {
+  if (array_key_exists($k, $_ENV)) return $_ENV[$k];
+  if (array_key_exists($k, $_SERVER)) return $_SERVER[$k];
+  $v = getenv($k); return ($v!==false && $v!==null) ? $v : $d;
+}
+function fail(int $code, string $msg) {
+  http_response_code($code);
+  echo "<h2>Error</h2><pre>".htmlspecialchars($msg, ENT_QUOTES, 'UTF-8')."</pre>";
+  exit;
+}
+function b64url_encode(string $bin): string {
+  return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
+}
+function rand_b64url(int $bytes=32): string {
+  return b64url_encode(random_bytes($bytes));
+}
+function http_get_json(string $url, array $headers=[], bool $verifyPeer=true, bool $verifyHost=true): array {
+  $ch = curl_init($url);
+  curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER=>true,
+    CURLOPT_HTTPHEADER=>$headers,
+    CURLOPT_SSL_VERIFYPEER=>$verifyPeer,
+    CURLOPT_SSL_VERIFYHOST=>$verifyHost?2:0,
+    CURLOPT_TIMEOUT=>30,
+  ]);
+  $res = curl_exec($ch);
+  if ($res === false) { $e = curl_error($ch); curl_close($ch); fail(500, "GET $url failed: $e"); }
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+  if ($code < 200 || $code >= 300) fail(500, "GET $url returned HTTP $code\n$res");
+  $json = json_decode($res, true);
+  if (!is_array($json)) fail(500, "GET $url did not return JSON.");
+  return $json;
+}
+function http_post_form(string $url, array $fields, array $headers=[], bool $verifyPeer=true, bool $verifyHost=true): array {
+  $ch = curl_init($url);
+  curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER=>true,
+    CURLOPT_HEADER=>true,
+    CURLOPT_POST=>true,
+    CURLOPT_POSTFIELDS=>$fields,
+    CURLOPT_HTTPHEADER=>$headers,
+    CURLOPT_SSL_VERIFYPEER=>$verifyPeer,
+    CURLOPT_SSL_VERIFYHOST=>$verifyHost?2:0,
+    CURLOPT_TIMEOUT=>60,
+  ]);
+  $res = curl_exec($ch);
+  if ($res === false) { $e = curl_error($ch); curl_close($ch); fail(500, "POST $url failed: $e"); }
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  $hsz  = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+  curl_close($ch);
+  return ['status'=>$code, 'headers'=>substr($res,0,$hsz), 'body'=>substr($res,$hsz)];
+}
+function http_post_urlencoded(string $url, array $data, array $headers=[], bool $verifyPeer=true, bool $verifyHost=true): array {
+  $ch = curl_init($url);
+  curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER=>true,
+    CURLOPT_POST=>true,
+    CURLOPT_POSTFIELDS=>http_build_query($data),
+    CURLOPT_HTTPHEADER=>array_merge($headers, ['Content-Type: application/x-www-form-urlencoded']),
+    CURLOPT_SSL_VERIFYPEER=>$verifyPeer,
+    CURLOPT_SSL_VERIFYHOST=>$verifyHost?2:0,
+    CURLOPT_TIMEOUT=>30,
+  ]);
+  $res = curl_exec($ch);
+  if ($res === false) { $e = curl_error($ch); curl_close($ch); fail(500, "POST $url failed: $e"); }
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+  if ($code < 200 || $code >= 300) fail(500, "Token endpoint HTTP $code\n$res");
+  $json = json_decode($res, true);
+  if (!is_array($json)) fail(500, "Token endpoint did not return JSON.");
+  return $json;
 }
 
-session_start();
+/** ===== Config from env ===== */
+$hostBase      = rtrim((string)envv('OIDC_PROVIDER_URL'), '/');   // e.g. https://idp.example.com
+$tenant        = trim((string)envv('TENANT_NAME',''));            // e.g. worms
+$clientId      = envv('OIDC_CLIENT_ID');
+$clientSecret  = envv('OIDC_CLIENT_SECRET');                      // may be empty for public client + PKCE
+$redirectUri   = envv('OIDC_REDIRECT_URI');                       // EXACT deployed URL (no wildcard)
+$logoutTo      = envv('OIDC_LOGOUT_REDIRECT', '/');
+$verifyPeer    = envv('CURL_VERIFY_PEER','1')==='1';
+$verifyHost    = envv('CURL_VERIFY_HOST','1')==='1';
 
-/** ===== Config ===== */
-$providerBase   = rtrim((string)env('OIDC_PROVIDER_URL'), '/');   // e.g. https://idp.example.com
-$clientId       = env('OIDC_CLIENT_ID');
-$clientSecret   = env('OIDC_CLIENT_SECRET');                      // empty if client is public
-$redirectUri    = env('OIDC_REDIRECT_URI', 'http://localhost/oidc-php/');
-$logoutRedirect = env('OIDC_LOGOUT_REDIRECT', '/');
-$tenantName     = env('TENANT_NAME');                             // REQUIRED for /auth/realms/{TENANT_NAME}/...
-
-$curlVerifyPeer = env('CURL_VERIFY_PEER', '1') === '1';
-$curlVerifyHost = env('CURL_VERIFY_HOST', '1') === '1';
-
-if (!$providerBase || !$clientId || !$redirectUri || !$tenantName) {
-    http_response_code(500);
-    echo "<h2>Configuration error</h2><pre>" .
-         "OIDC_PROVIDER_URL, OIDC_CLIENT_ID, OIDC_REDIRECT_URI, TENANT_NAME are required.\n" .
-         "OIDC_PROVIDER_URL=" . var_export($providerBase, true) . "\n" .
-         "OIDC_CLIENT_ID="    . var_export($clientId, true)    . "\n" .
-         "OIDC_REDIRECT_URI=" . var_export($redirectUri, true) . "\n" .
-         "TENANT_NAME="       . var_export($tenantName, true)  . "\n" .
-         "</pre>";
-    exit;
+if (!$hostBase || !$tenant || !$clientId || !$redirectUri) {
+  fail(500, "Missing env: OIDC_PROVIDER_URL(host base), TENANT_NAME, OIDC_CLIENT_ID, OIDC_REDIRECT_URI");
 }
 
-/** ===== CSRF helpers ===== */
-if (empty($_SESSION['csrf'])) { $_SESSION['csrf'] = bin2hex(random_bytes(32)); }
+/** ===== Build realm issuer (modern & legacy), discover endpoints ===== */
+$issuerModern = $hostBase . '/realms/' . rawurlencode($tenant);
+$issuerLegacy = $hostBase . '/auth/realms/' . rawurlencode($tenant);
+
+$discovery = null;
+$issuerUsed = null;
+try {
+  $discovery = http_get_json($issuerModern.'/.well-known/openid-configuration', [], $verifyPeer, $verifyHost);
+  $issuerUsed = $issuerModern;
+} catch (\Throwable $e) {
+  $discovery = http_get_json($issuerLegacy.'/.well-known/openid-configuration', [], $verifyPeer, $verifyHost);
+  $issuerUsed = $issuerLegacy;
+}
+
+$authEndpoint  = $discovery['authorization_endpoint'] ?? null;
+$tokenEndpoint = $discovery['token_endpoint'] ?? null;
+$userinfoEP    = $discovery['userinfo_endpoint'] ?? null;
+if (!$authEndpoint || !$tokenEndpoint) {
+  fail(500, "Discovery missing endpoints.");
+}
+
+/** ===== Cookie helpers for stateless flow ===== */
+function set_cookie(string $name, string $val, int $ttl=600): void {
+  setcookie($name, $val, [
+    'expires'=> time()+$ttl,
+    'path'   => '/',
+    'secure' => true,
+    'httponly'=> true,
+    'samesite'=> 'Lax',
+  ]);
+}
+function get_cookie(string $name): ?string {
+  return isset($_COOKIE[$name]) ? (string)$_COOKIE[$name] : null;
+}
+function del_cookie(string $name): void {
+  setcookie($name, '', time()-3600, '/');
+}
+
+/** ===== CSRF for the HTML form ===== */
+if (!get_cookie('csrf')) { set_cookie('csrf', bin2hex(random_bytes(32))); }
 function csrf_input(): string {
-    return '<input type="hidden" name="csrf" value="' . htmlspecialchars($_SESSION['csrf'], ENT_QUOTES, 'UTF-8') . '">';
+  $v = htmlspecialchars(get_cookie('csrf') ?? '', ENT_QUOTES, 'UTF-8');
+  return '<input type="hidden" name="csrf" value="'.$v.'">';
 }
 function check_csrf(): void {
-    if (!isset($_POST['csrf']) || !hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'])) {
-        http_response_code(400); exit('Bad Request (CSRF)');
-    }
+  $cookie = get_cookie('csrf') ?? '';
+  $posted = $_POST['csrf'] ?? '';
+  if (!$cookie || !$posted || !hash_equals($cookie, (string)$posted)) fail(400, 'Bad Request (CSRF)');
 }
 
-/** ===== Logout ===== */
-if (isset($_GET['action']) && $_GET['action'] === 'logout') {
-    $_SESSION = [];
-    if (ini_get('session.use_cookies')) {
-        $p = session_get_cookie_params();
-        setcookie(session_name(), '', time() - 42000, $p['path'] ?? '/', $p['domain'] ?? '', (bool)$p['secure'], (bool)$p['httponly']);
-    }
-    session_destroy();
-    header('Location: ' . $logoutRedirect);
-    exit;
+/** ===== Begin OIDC Authorization Code + PKCE ===== */
+$code  = $_GET['code']  ?? null;
+$state = $_GET['state'] ?? null;
+
+if (!$code) {
+  // Start login
+  $stateVal  = rand_b64url(16);
+  $nonceVal  = rand_b64url(16);
+  $verifier  = rand_b64url(32);
+  $challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
+
+  set_cookie('oidc_state',  $stateVal);
+  set_cookie('oidc_nonce',  $nonceVal);
+  set_cookie('oidc_verif',  $verifier);
+
+  $params = [
+    'response_type' => 'code',
+    'client_id'     => $clientId,
+    'redirect_uri'  => $redirectUri,
+    'scope'         => 'openid profile email',
+    'state'         => $stateVal,
+    'nonce'         => $nonceVal,
+    'code_challenge' => $challenge,
+    'code_challenge_method' => 'S256',
+  ];
+
+  // Build auth URL
+  $authUrl = $authEndpoint . '?' . http_build_query($params);
+  header('Location: ' . $authUrl);
+  exit;
 }
 
-/** ===== OIDC authenticate (Keycloak) ===== */
-try {
-    /**
-     * For discovery, we need the issuer (realm) URL. You gave $OIDC_PROVIDER_URL as host base.
-     * For Keycloak, the realm issuer is: {host}/realms/{TENANT}  OR  {host}/auth/realms/{TENANT}.
-     * We'll try modern first, then legacy, and let the client discover.
-     */
-    $issuerModern = $providerBase . '/realms/' . rawurlencode($tenantName);
-    $issuerLegacy = $providerBase . '/auth/realms/' . rawurlencode($tenantName);
+// Callback: validate state, exchange code
+$stateCookie = get_cookie('oidc_state');
+$verifier    = get_cookie('oidc_verif');
+if (!$stateCookie || !$verifier || !hash_equals($stateCookie, (string)$state)) {
+  fail(400, "Invalid or missing state.");
+}
+del_cookie('oidc_state'); // one-time
 
-    // Try modern first; if it fails in authenticate step, we’ll retry legacy once.
-    $issuerTried  = $issuerModern;
-    $oidc = new OpenIDConnectClient($issuerTried, $clientId, $clientSecret);
-    $oidc->setRedirectURL($redirectUri);
-
-    // Request scopes as an ARRAY (your library expects array).
-    // If your realm rejects profile/email, change to ['openid'].
-    $oidc->addScope(['openid', 'profile', 'email']);
-
-    $tryAuth = function(OpenIDConnectClient $client) {
-        $client->authenticate();
-    };
-
-    try {
-        $tryAuth($oidc);
-    } catch (\Throwable $e1) {
-        // Retry once with legacy /auth issuer
-        $issuerTried = $issuerLegacy;
-        $oidc = new OpenIDConnectClient($issuerTried, $clientId, $clientSecret);
-        $oidc->setRedirectURL($redirectUri);
-        $oidc->addScope(['openid', 'profile', 'email']);
-        $tryAuth($oidc);
-    }
-
-    $accessToken   = $oidc->getAccessToken();
-    $idTokenClaims = $oidc->getVerifiedClaims();
-    $userinfo      = $oidc->requestUserInfo();
-    $claims        = array_merge((array)$idTokenClaims, (array)$userinfo);
-
-    // We will use EMAIL as USER_ID per your requirement
-    $email      = $claims['email']        ?? '';
-    $givenName  = $claims['given_name']   ?? '';
-    $familyName = $claims['family_name']  ?? '';
-    $name       = $claims['name']         ?? '';
-
-    if (!$email) {
-        http_response_code(500);
-        echo "<h2>Missing email</h2><p>The token/userinfo did not include 'email'. Ensure the client has the 'email' scope assigned.</p>";
-        exit;
-    }
-    if (!$givenName && !$familyName && $name) {
-        $parts = preg_split('/\s+/', $name, 2);
-        $givenName  = $parts[0] ?? '';
-        $familyName = $parts[1] ?? '';
-    }
-
-} catch (\Throwable $e) {
-    http_response_code(500);
-    echo "<h2>Login error</h2><pre>" . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8') . "</pre>";
-    exit;
+// Exchange code for tokens
+$post = [
+  'grant_type'    => 'authorization_code',
+  'code'          => $code,
+  'redirect_uri'  => $redirectUri,
+  'client_id'     => $clientId,
+  'code_verifier' => $verifier,
+];
+// Use client_secret only if confidential client
+if (strlen((string)$clientSecret) > 0) {
+  $post['client_secret'] = $clientSecret;
 }
 
-/** ===== Helpers ===== */
+$token = http_post_urlencoded($tokenEndpoint, $post, [], $verifyPeer, $verifyHost);
+$accessToken = $token['access_token'] ?? null;
+if (!$accessToken) fail(500, "No access_token from token endpoint.");
 
-/** Build EXACT Chat API endpoint:
- *  {providerBase}/auth/realms/{TENANT_NAME}/mpower/v1/users/{USER_ID}/media
- *  (always using /auth/realms per your spec)
- */
-function build_chat_api_url(string $providerBase, string $tenant, string $userEmail): string {
-    $base = rtrim($providerBase, '/'); // host base only
-    return $base . '/auth/realms/' . rawurlencode($tenant) . '/mpower/v1/users/' . rawurlencode($userEmail) . '/media';
+// Fetch userinfo
+$headers = ['Authorization: Bearer '.$accessToken];
+$userinfo = $userinfoEP ? http_get_json($userinfoEP, $headers, $verifyPeer, $verifyHost) : [];
+$email      = $userinfo['email']       ?? '';
+$givenName  = $userinfo['given_name']  ?? '';
+$familyName = $userinfo['family_name'] ?? '';
+$name       = $userinfo['name']        ?? '';
+
+if (!$email) {
+  // Some IdPs need email scope assigned or return in different claim
+  fail(500, "Missing email in userinfo. Ensure 'email' scope is assigned to the client.");
+}
+if (!$givenName && !$familyName && $name) {
+  $parts = preg_split('/\s+/', $name, 2);
+  $givenName  = $parts[0] ?? '';
+  $familyName = $parts[1] ?? '';
 }
 
-/** Make a simple PDF from current form values */
+/** ===== Helpers: PDF + Chat API upload ===== */
 function make_pdf_from_form(array $data): string {
-    $first = htmlspecialchars($data['first_name'] ?? '', ENT_QUOTES, 'UTF-8');
-    $last  = htmlspecialchars($data['last_name'] ?? '', ENT_QUOTES, 'UTF-8');
-    $email = htmlspecialchars($data['email'] ?? '', ENT_QUOTES, 'UTF-8');
-    $now   = date('Y-m-d H:i:s');
+  $first = htmlspecialchars($data['first_name'] ?? '', ENT_QUOTES, 'UTF-8');
+  $last  = htmlspecialchars($data['last_name'] ?? '',  ENT_QUOTES, 'UTF-8');
+  $email = htmlspecialchars($data['email'] ?? '',      ENT_QUOTES, 'UTF-8');
+  $now   = date('Y-m-d H:i:s');
 
-    $html = <<<HTML
+  $html = <<<HTML
 <!doctype html>
 <html><head><meta charset="utf-8">
 <style>
@@ -173,108 +259,122 @@ function make_pdf_from_form(array $data): string {
 </body></html>
 HTML;
 
-    $options = new Options();
-    $options->set('isRemoteEnabled', false);
-    $dompdf = new Dompdf($options);
-    $dompdf->loadHtml($html);
-    $dompdf->setPaper('A4', 'portrait');
-    $dompdf->render();
-    return $dompdf->output(); // raw PDF bytes
+  $opts = new Options(); $opts->set('isRemoteEnabled', false);
+  $dompdf = new Dompdf($opts);
+  $dompdf->loadHtml($html);
+  $dompdf->setPaper('A4', 'portrait');
+  $dompdf->render();
+  return $dompdf->output();
 }
 
-/** Upload PDF via multipart/form-data (attachment + message) with Bearer token */
-function post_pdf_to_media_api(
-    string $url,
-    string $accessToken,
-    string $pdfBytes,
-    string $filename,
-    string $message = '',
-    bool $verifyPeer = true,
-    bool $verifyHost = true
-): array {
-    $tmp = tmpfile();
-    $tmpPath = stream_get_meta_data($tmp)['uri'];
-    file_put_contents($tmpPath, $pdfBytes);
-    $cfile = new CURLFile($tmpPath, 'application/pdf', $filename);
-
-    $ch = curl_init($url);
-    $headers = [
-        'Accept: application/json',
-        'Authorization: Bearer ' . $accessToken,
-        // DO NOT set Content-Type manually; cURL will set the correct multipart boundary.
-    ];
-    $postFields = [
-        'attachment' => $cfile,
-        'message'    => $message,
-    ];
-
-    curl_setopt_array($ch, [
-        CURLOPT_POST            => true,
-        CURLOPT_POSTFIELDS      => $postFields,
-        CURLOPT_HTTPHEADER      => $headers,
-        CURLOPT_RETURNTRANSFER  => true,
-        CURLOPT_HEADER          => true,
-        CURLOPT_SSL_VERIFYPEER  => $verifyPeer,
-        CURLOPT_SSL_VERIFYHOST  => $verifyHost ? 2 : 0,
-        CURLOPT_TIMEOUT         => 60,
-    ]);
-
-    $resp = curl_exec($ch);
-    if ($resp === false) {
-        $err = curl_error($ch);
-        curl_close($ch);
-        fclose($tmp);
-        throw new RuntimeException("cURL error: $err");
-    }
-    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $rawHeaders = substr($resp, 0, $headerSize);
-    $body = substr($resp, $headerSize);
-
-    curl_close($ch);
-    fclose($tmp);
-
-    return ['status' => $status, 'headers' => $rawHeaders, 'body' => $body];
+function chat_api_url(string $hostBase, string $tenant, string $userEmail): string {
+  $base = rtrim($hostBase, '/');
+  // Per your spec: always /auth/realms/{TENANT_NAME}
+  return $base . '/auth/realms/' . rawurlencode($tenant) . '/mpower/v1/users/' . rawurlencode($userEmail) . '/media';
 }
 
-/** ===== Handle POST (Send as PDF) ===== */
+function upload_pdf_to_chat_api(string $url, string $accessToken, string $pdfBytes, string $filename, string $message, bool $verifyPeer=true, bool $verifyHost=true): array {
+  $tmp = tmpfile();
+  $tmpPath = stream_get_meta_data($tmp)['uri'];
+  file_put_contents($tmpPath, $pdfBytes);
+  $cfile = new CURLFile($tmpPath, 'application/pdf', $filename);
+
+  $headers = [
+    'Accept: application/json',
+    'Authorization: Bearer '.$accessToken,
+    // DO NOT set Content-Type; cURL will set multipart boundary.
+  ];
+  $fields = [
+    'attachment' => $cfile,
+    'message'    => $message,
+  ];
+
+  $resp = http_post_form($url, $fields, $headers, $verifyPeer, $verifyHost);
+  fclose($tmp);
+  return $resp;
+}
+
+/** ===== Handle form POST (Send as PDF) ===== */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    check_csrf();
+  // CSRF
+  $cookieCsrf = get_cookie('csrf') ?? '';
+  $postedCsrf = $_POST['csrf'] ?? '';
+  if (!$cookieCsrf || !$postedCsrf || !hash_equals($cookieCsrf, (string)$postedCsrf)) {
+    fail(400, 'Bad Request (CSRF)');
+  }
 
-    if (isset($_POST['send_pdf'])) {
-        // Use current form values to render PDF (prefill fallback from claims)
-        $firstName = trim($_POST['first_name'] ?? '') ?: ($givenName ?? '');
-        $lastName  = trim($_POST['last_name']  ?? '') ?: ($familyName ?? '');
-        $emailForm = trim($_POST['email']      ?? '') ?: ($email ?? '');
-        $message   = trim($_POST['message']    ?? '');
+  if (isset($_POST['send_pdf'])) {
+    $firstName = trim($_POST['first_name'] ?? '') ?: $givenName;
+    $lastName  = trim($_POST['last_name']  ?? '') ?: $familyName;
+    $emailForm = trim($_POST['email']      ?? '') ?: $email;
+    $message   = trim($_POST['message']    ?? '');
 
-        // USER_ID = email used to login (per your requirement)
-        $userIdForPath = $emailForm;
-        if (!$userIdForPath) {
-            http_response_code(500);
-            echo "<h2>Cannot determine USER_ID</h2><p>Email is empty; cannot build endpoint.</p>";
-            exit;
-        }
+    if (!$emailForm) fail(500, 'Email (USER_ID) is empty.');
 
-        // Build exact endpoint with /auth/realms/{TENANT_NAME}
-        $mediaUrl = build_chat_api_url($providerBase, $tenantName, $userIdForPath);
+    $pdf = make_pdf_from_form([
+      'first_name' => $firstName,
+      'last_name'  => $lastName,
+      'email'      => $emailForm,
+    ]);
+    $endpoint = chat_api_url($hostBase, $tenant, $emailForm);
+    $res = upload_pdf_to_chat_api($endpoint, $accessToken, $pdf, 'profile-'.date('Ymd-His').'.pdf', $message, $verifyPeer, $verifyHost);
 
-        // Generate PDF
-        try {
-            $pdfBytes = make_pdf_from_form([
-                'first_name' => $firstName,
-                'last_name'  => $lastName,
-                'email'      => $emailForm,
-            ]);
-        } catch (\Throwable $e) {
-            http_response_code(500);
-            echo "<h2>PDF generation error</h2><pre>" . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8') . "</pre>";
-            exit;
-        }
+    echo "<h2>Uploaded</h2>";
+    echo "<p>Endpoint: <code>".htmlspecialchars($endpoint,ENT_QUOTES,'UTF-8')."</code></p>";
+    echo "<p>Status: <strong>".htmlspecialchars((string)$res['status'],ENT_QUOTES,'UTF-8')."</strong></p>";
+    echo "<details><summary>Response body</summary><pre>".htmlspecialchars($res['body'],ENT_QUOTES,'UTF-8')."</pre></details>";
+    echo '<p><a href="'.htmlspecialchars($redirectUri,ENT_QUOTES,'UTF-8').'">Back</a></p>';
+    exit;
+  }
 
-        // Upload to Chat API
-        try {
-            $filename = 'profile-' . date('Ymd-His') . '.pdf';
-            $resp = post_pdf_to_media_api($mediaUrl, $accessToken, $pdfBytes, $filename, $message, $curlVerifyPeer, $curlVerifyHost);
+  header('Location: '.$redirectUri);
+  exit;
+}
 
-            echo "<h2>Uploaded
+/** ===== Render UI ===== */
+?>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>OIDC → Prefilled Form → Send as PDF (stateless)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; line-height: 1.5; }
+    form { max-width: 560px; display: grid; gap: 1rem; }
+    label { font-weight: 600; }
+    input, textarea { padding: .6rem; border: 1px solid #ccc; border-radius: 8px; width: 100%; }
+    button { padding: .7rem 1rem; border: 0; border-radius: 10px; cursor: pointer; background: #0070f3; color: #fff; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .topbar { display:flex; justify-content: space-between; align-items:center; margin-bottom:1.25rem; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>Welcome <?= htmlspecialchars($givenName ?: 'User', ENT_QUOTES, 'UTF-8'); ?> 👋</h1>
+    <a href="<?= htmlspecialchars($logoutTo, ENT_QUOTES, 'UTF-8'); ?>"><button>Logout</button></a>
+  </div>
+
+  <form method="post" action="">
+    <?= csrf_input(); ?>
+    <div class="row">
+      <div>
+        <label for="first_name">First name</label>
+        <input id="first_name" name="first_name" value="<?= htmlspecialchars($givenName, ENT_QUOTES, 'UTF-8'); ?>">
+      </div>
+      <div>
+        <label for="last_name">Last name</label>
+        <input id="last_name" name="last_name" value="<?= htmlspecialchars($familyName, ENT_QUOTES, 'UTF-8'); ?>">
+      </div>
+    </div>
+
+    <label for="email">Email (used as USER_ID)</label>
+    <input id="email" type="email" name="email" value="<?= htmlspecialchars($email, ENT_QUOTES, 'UTF-8'); ?>">
+
+    <label for="message">Optional message</label>
+    <textarea id="message" name="message" rows="3" placeholder="(leave empty if not needed)"></textarea>
+
+    <button type="submit" name="send_pdf">Send as PDF</button>
+  </form>
+</body>
+</html>
