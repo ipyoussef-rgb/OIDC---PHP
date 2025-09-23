@@ -149,7 +149,7 @@ if(!$hostBase||!$tenant||!$clientId||!$redirectUri||!$serviceUuid){
 // 3) OIDC Discovery (supports modern and legacy Keycloak paths)
 //////////////////////////////////////////////////////////////////
 
-$issuerModern = $hostBase.'/realms/'.rawurlencode($tenant);
+$issuerModern = $hostBase.'/auth/realms/'.rawurlencode($tenant);
 $issuerLegacy = $hostBase.'/auth/realms/'.rawurlencode($tenant);
 try { $disc=http_get_json($issuerModern.'/.well-known/openid-configuration',[], $verifyPeer,$verifyHost); $issuer=$issuerModern; }
 catch(\Throwable){ $disc=http_get_json($issuerLegacy.'/.well-known/openid-configuration',[], $verifyPeer,$verifyHost); $issuer=$issuerLegacy; }
